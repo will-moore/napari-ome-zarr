@@ -1,31 +1,26 @@
-
-
 # zarr v3
 
-import zarr
-from zarr import Group
-from zarr.core.sync import SyncMixin
-from zarr.core.buffer import default_buffer_prototype
-
-import dask.array as da
-from typing import List
-from vispy.color import Colormap
+from typing import Any, Dict, List, Tuple, Union
 from xml.etree import ElementTree as ET
 
-from typing import Any, Dict, List, Tuple, Union
+import dask.array as da
+import zarr
+from vispy.color import Colormap
+from zarr import Group
+from zarr.core.buffer import default_buffer_prototype
+from zarr.core.sync import SyncMixin
 
 LayerData = Union[Tuple[Any], Tuple[Any, Dict], Tuple[Any, Dict, str]]
 
 
-class Spec():
-
+class Spec:
     def __init__(self, group: Group):
         self.group = group
 
     @staticmethod
     def matches(group: Group) -> bool:
         return False
-    
+
     def data(self) -> List[da.core.Array] | None:
         return None
 
@@ -39,8 +34,7 @@ class Spec():
     def iter_nodes(self):
         yield self
         for child in self.children():
-            for ch in child.iter_nodes():
-                yield ch
+            yield from child.iter_nodes()
 
     def iter_data(self):
         for node in self.iter_nodes():
@@ -56,7 +50,6 @@ class Spec():
 
 
 class Multiscales(Spec):
-
     @staticmethod
     def matches(group: Group) -> bool:
         return "multiscales" in Spec.get_attrs(group)
@@ -127,8 +120,8 @@ class Multiscales(Spec):
 
         return rsp
 
-class Bioformats2raw(Spec):
 
+class Bioformats2raw(Spec):
     @staticmethod
     def matches(group: Group) -> bool:
         attrs = Spec.get_attrs(group)
@@ -137,7 +130,11 @@ class Bioformats2raw(Spec):
 
     def children(self):
         # lookup children from series of OME/METADATA.xml
-        xml_data = SyncMixin()._sync(self.group.store.get("OME/METADATA.ome.xml", prototype=default_buffer_prototype()))
+        xml_data = SyncMixin()._sync(
+            self.group.store.get(
+                "OME/METADATA.ome.xml", prototype=default_buffer_prototype()
+            )
+        )
         # print("xml_data", xml_data.to_bytes())
         root = ET.fromstring(xml_data.to_bytes())
         rv = []
@@ -156,19 +153,16 @@ class Bioformats2raw(Spec):
     # override to NOT yield self since node has no data
     def iter_nodes(self):
         for child in self.children():
-            for ch in child.iter_nodes():
-                yield ch
-    
+            yield from child.iter_nodes()
+
 
 class Plate(Spec):
-
     @staticmethod
     def matches(group: Group) -> bool:
         return "plate" in Spec.get_attrs(group)
 
 
 class Label(Multiscales):
-
     @staticmethod
     def matches(group: Group) -> bool:
         # label must also be Multiscales
@@ -182,12 +176,10 @@ class Label(Multiscales):
 
 
 def read_ome_zarr(url):
-
     def f(*args: Any, **kwargs: Any) -> List[LayerData]:
-
         results: List[LayerData] = list()
 
-        # TODO: handle missing file 
+        # TODO: handle missing file
         root_group = zarr.open(url)
 
         print("Root group", root_group.attrs.asdict())
@@ -214,5 +206,5 @@ def read_ome_zarr(url):
                 results.append(rv)
 
         return results
-    
+
     return f
