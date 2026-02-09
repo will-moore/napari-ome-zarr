@@ -8,6 +8,7 @@ import dask.array as da
 import numpy as np
 import zarr
 from napari.utils.colormaps import AVAILABLE_COLORMAPS, Colormap
+from napari.utils.transforms import Affine
 from zarr import Group
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import SyncMixin
@@ -45,9 +46,102 @@ def _match_colors_to_available_colormap(custom_cmap: Colormap) -> Colormap:
     return custom_cmap
 
 
+def remove_axis_from_transform(transform: Dict[str, Any], axis: int) -> Dict[str, Any]:
+    """Remove a specific axis from an OME-Zarr transform dict."""
+    new_transform = transform.copy()
+    if transform["type"] == "scale":
+        new_scale = transform["scale"][:]
+        del new_scale[axis]
+        new_transform["scale"] = new_scale
+    if transform["type"] == "translation":
+        new_translation = transform["translation"][:]
+        del new_translation[axis]
+        new_transform["translation"] = new_translation
+    if transform["type"] == "rotation":
+        matrix = np.array(transform["rotation"])
+        matrix = np.delete(matrix, axis, 0)  # remove row
+        matrix = np.delete(matrix, axis, 1)  # remove column
+        new_transform["rotation"] = matrix.tolist()
+    if transform["type"] == "affine":
+        matrix = np.array(transform["affine"])
+        matrix = np.delete(matrix, axis, 0)  # remove row
+        matrix = np.delete(matrix, axis, 1)  # remove column
+        new_transform["affine"] = matrix.tolist()
+    if transform["type"] == "sequence":
+        new_transforms = []
+        for sub_transform in transform["transformations"]:
+            new_sub_transform = remove_axis_from_transform(sub_transform, axis)
+            new_transforms.append(new_sub_transform)
+        new_transform["transformations"] = new_transforms
+    return new_transform
+
+
+def transform_to_affine(transform: Dict[str, Any]) -> Affine:
+    """Convert a single OME-Zarr transform dict to an Affine object."""
+    aff: Affine = None
+    if transform["type"] == "scale":
+        aff = Affine(scale=transform["scale"])
+    if transform["type"] == "translation":
+        aff = Affine(translate=transform["translation"])
+    if transform["type"] == "rotation":
+        matrix = np.array(transform["rotation"])
+        # Spec says that rotation matrix is 1 row and column smaller than affine
+        matrix = np.pad(
+            matrix,
+            pad_width=((0, 1), (0, 1)),
+            mode="constant",
+            constant_values=0,
+        )
+        matrix[-1, -1] = 1
+        aff = Affine(affine_matrix=matrix)
+    if transform["type"] == "affine":
+        matrix = np.array(transform["affine"])
+        # Spec says that rotation matrix is 1 row smaller than affine
+        matrix = np.pad(
+            matrix,
+            pad_width=((0, 1), (0, 0)),
+            mode="constant",
+            constant_values=0,
+        )
+        matrix[-1, -1] = 1
+        aff = Affine(affine_matrix=matrix)
+    return aff
+
+
+def transforms_to_affine(
+    transforms: List[Dict[str, Any]], channel_axis: int | None
+) -> Affine:
+    # first unwrap and flatten any 'sequence' transforms...
+    # NB: if any 'sequence' contains another 'sequence' this is ignored.
+    flat_transforms: List[Dict[str, Any]] = []
+    for transf in transforms:
+        if transf["type"] == "sequence":
+            flat_transforms.extend(transf["transformations"])
+        else:
+            flat_transforms.append(transf)
+
+    # Don't create Affine until we know dimensions...
+    aff: Affine = None
+    for transf in flat_transforms:
+        print("transforms_to_affine..........ch,transf", channel_axis, transf)
+        trans_aff = transform_to_affine(transf)
+        if aff is None:
+            aff = trans_aff
+        elif trans_aff is not None:
+            aff = trans_aff.compose(aff)
+    # finally, remove channel axis from 2D matrix
+    if channel_axis is not None:
+        matrix = aff.affine_matrix
+        for dim in (0, 1):
+            matrix = np.delete(matrix, channel_axis, dim)
+        aff = Affine(affine_matrix=matrix)
+    return aff
+
+
 class Spec(ABC):
     def __init__(self, group: Group) -> None:
         self.group = group
+        self.parent_transforms: List[Dict[str, Any]] = []
 
     @staticmethod
     def matches(group: Group) -> bool:
@@ -96,7 +190,12 @@ class Multiscales(Spec):
                 for name in attrs["labels"]:
                     g = grp[name]
                     if Label.matches(g):
-                        ch.append(Label(g))
+                        label_image = Label(g)
+                        # Label inherits parent transforms
+                        ch_axis = self.metadata().get("channel_axis", None)
+                        for transf in self.parent_transforms:
+                            label_image.add_parent_transform(transf, ch_axis)
+                        ch.append(label_image)
         except KeyError:
             pass
         return ch
@@ -111,6 +210,10 @@ class Multiscales(Spec):
         attrs = Spec.get_attrs(self.group)
         # No axes (v0.1, v0.2), assume 5D (t,c,z,y,x)
         axes = attrs["multiscales"][0].get("axes", AXES_5D)
+        # For v0.6, axes are nested in 'coordinateSystems'
+        if "coordinateSystems" in ["multiscales"][0]:
+            # TODO: handle > 1 coordinateSystem - option to choose?
+            axes = attrs["multiscales"][0]["coordinateSystems"][0]["axes"]
         atypes = []
         for axis in axes:
             if isinstance(axis, str):
@@ -123,18 +226,22 @@ class Multiscales(Spec):
         if "channel" in atypes:
             channel_axis = atypes.index("channel")
             rsp["channel_axis"] = channel_axis
+
+        transforms = []
+
+        # First we handle transforms from datasets[0]...
         if "coordinateTransformations" in dataset_0:
-            for transf in dataset_0["coordinateTransformations"]:
-                if "scale" in transf:
-                    scale = transf["scale"]
-                    if channel_axis is not None:
-                        scale.pop(channel_axis)
-                    rsp["scale"] = tuple(scale)
-                if "translation" in transf:
-                    translate = transf["translation"]
-                    if channel_axis is not None:
-                        translate.pop(channel_axis)
-                    rsp["translate"] = tuple(translate)
+            transforms.extend(dataset_0["coordinateTransformations"])
+        # Then check for coordinateTransformations at top level
+        if "coordinateTransformations" in attrs["multiscales"][0]:
+            transforms.extend(attrs["multiscales"][0]["coordinateTransformations"])
+        # Finally add any parent transforms (e.g. from CoordinateSystems)
+        transforms.extend(self.parent_transforms)
+
+        # compile all transforms into single Affine
+        print("\nALL transforms:", transforms)
+        rsp["affine"] = transforms_to_affine(transforms, channel_axis)
+
         if "omero" in attrs:
             colormaps = []
             ch_names = []
@@ -206,6 +313,50 @@ class Bioformats2raw(Spec):
                 g = self.group[image_path]
                 if Multiscales.matches(g):
                     rv.append(Multiscales(g))
+        return rv
+
+    # override to NOT yield self since node has no data
+    def iter_nodes(self) -> Iterable[Spec]:
+        for child in self.children():
+            yield from child.iter_nodes()
+
+
+class CoordinateSystems(Spec):
+    @staticmethod
+    def matches(group: Group) -> bool:
+        attrs = Spec.get_attrs(group)
+        print("CoordinateSystems.matches", attrs)
+        return "coordinateTransformations" in attrs
+
+    def children(self) -> list[Spec]:
+        # lookup children from coordinateTransformations 'input' paths
+        rv: list[Spec] = []
+        transfs = self.get_attrs(self.group).get("coordinateTransformations", [])
+        output = None
+        for transf in transfs:
+            image_path = transf.get("input")
+            out = transf.get("output")
+            if output is None:
+                output = out
+            elif output != out:
+                print(f"WARNING: '{out}' output different from previous '{output}'")
+                continue
+            g = self.group[image_path]
+            print("coordinateSystems child", image_path, g)
+            if Multiscales.matches(g):
+                ms_image = Multiscales(g)
+                # child image gets the parent transform
+                ms_image.parent_transforms.append(transf)
+                rv.append(ms_image)
+
+        # check if 'output' is path to image...
+        try:
+            g = self.group[output]
+            if Multiscales.matches(g):
+                # Add to start (layer behind other tiles)
+                rv.insert(0, Multiscales(g))
+        except KeyError:
+            pass
         return rv
 
     # override to NOT yield self since node has no data
@@ -290,6 +441,21 @@ class Label(Multiscales):
         if not Multiscales.matches(group):
             return False
         return "image-label" in Spec.get_attrs(group)
+
+    def add_parent_transform(
+        self, transform: Dict[str, Any], parent_channel_axis: int | None
+    ) -> None:
+        # Add the parent transform to the current transform. If
+        # parent_channel_axis is not in Label, we need to remove that axis
+        # from the transform.
+        label_channel_axis = self.metadata().get("channel_axis", None)
+        if (
+            parent_channel_axis is not None
+            and parent_channel_axis != label_channel_axis
+        ):
+            print("remove axis from transform", parent_channel_axis)
+            transform = remove_axis_from_transform(transform, parent_channel_axis)
+        self.parent_transforms.append(transform)
 
     def metadata(self) -> Dict[str, Any]:
         # override Multiscales metadata
@@ -389,12 +555,16 @@ def read_ome_zarr(root_group: Group) -> Callable:
             spec = Multiscales(root_group)
         elif Plate.matches(root_group):
             spec = Plate(root_group)
+        elif CoordinateSystems.matches(root_group):
+            print("CoordinateSystems")
+            spec = CoordinateSystems(root_group)
         else:
             print("No matching spec", root_group)
 
         if spec:
             nodes = list(spec.iter_nodes())
             for node in nodes:
+                print("node", node, node.group)
                 node_data = node.data()
                 metadata = node.metadata()
                 print("Node:", node.group.name, "metadata:", metadata)
