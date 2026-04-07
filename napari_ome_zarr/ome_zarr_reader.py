@@ -89,14 +89,14 @@ class Multiscales(Spec):
 
     def __init__(self, group: Group) -> None:
         super().__init__(group)
-        self.ngffMultiscalse = NgffMultiscales.from_ome_zarr(group)
+        self.ngffMultiscales = NgffMultiscales.from_ome_zarr(group)
 
     def children(self) -> list[Spec]:
         ch: list[Spec] = []
         # We use labels keys, but not the lables NgffMultiscales...
-        if self.ngffMultiscalse.labels is not None:
+        if self.ngffMultiscales.labels is not None:
             grp = self.group["labels"]
-            labels_paths = self.ngffMultiscalse.labels.keys()
+            labels_paths = self.ngffMultiscales.labels.keys()
             for label_path in labels_paths:
                 try:
                     g = grp[label_path]
@@ -107,13 +107,13 @@ class Multiscales(Spec):
         return ch
 
     def data(self) -> list[da.core.Array]:
-        return [img.data for img in self.ngffMultiscalse.images]
+        return [img.data for img in self.ngffMultiscales.images]
 
     def metadata(self) -> Dict[str, Any]:
         rsp: dict = {}
         attrs = Spec.get_attrs(self.group)
-        scales = self.ngffMultiscalse.images[0].scale
-        axes_names = self.ngffMultiscalse.images[0].axes
+        scales = self.ngffMultiscales.images[0].scale
+        axes_names = self.ngffMultiscales.images[0].axes
         rsp["scale"] = [scales[ax] for ax in axes_names if ax != "c"]
         # We don't know "type" of axes, but can use name:
         if "c" in axes_names:
