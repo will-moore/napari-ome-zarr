@@ -8,6 +8,7 @@ import dask.array as da
 import numpy as np
 import zarr
 from napari.utils.colormaps import AVAILABLE_COLORMAPS, Colormap
+from ome_zarr.image import NgffMultiscales
 from zarr import Group
 from zarr.core.buffer import default_buffer_prototype
 from zarr.core.sync import SyncMixin
@@ -86,55 +87,39 @@ class Multiscales(Spec):
     def matches(group: Group) -> bool:
         return "multiscales" in Spec.get_attrs(group)
 
+    def __init__(self, group: Group) -> None:
+        super().__init__(group)
+        self.ngffMultiscales = NgffMultiscales.from_ome_zarr(group)
+
     def children(self) -> list[Spec]:
         ch: list[Spec] = []
-        # test for child "labels"
-        try:
+        # We use labels keys, but not the lables NgffMultiscales...
+        if self.ngffMultiscales.labels is not None:
             grp = self.group["labels"]
-            attrs = Spec.get_attrs(grp)
-            if "labels" in attrs:
-                for name in attrs["labels"]:
-                    g = grp[name]
+            labels_paths = self.ngffMultiscales.labels.keys()
+            for label_path in labels_paths:
+                try:
+                    g = grp[label_path]
                     if Label.matches(g):
                         ch.append(Label(g))
-        except KeyError:
-            pass
+                except KeyError:
+                    pass
         return ch
 
     def data(self) -> list[da.core.Array]:
-        attrs = Spec.get_attrs(self.group)
-        paths = [ds["path"] for ds in attrs["multiscales"][0]["datasets"]]
-        return [da.from_zarr(self.group[path]) for path in paths]
+        return [img.data for img in self.ngffMultiscales.images]
 
     def metadata(self) -> Dict[str, Any]:
         rsp: dict = {}
         attrs = Spec.get_attrs(self.group)
-        # No axes (v0.1, v0.2), assume 5D (t,c,z,y,x)
-        axes = attrs["multiscales"][0].get("axes", AXES_5D)
-        atypes = []
-        for axis in axes:
-            if isinstance(axis, str):
-                # v0.3
-                atypes.append(AXES_TYPES.get(axis.lower(), "space"))
-            else:
-                atypes.append(axis.get("type", "space"))
-        dataset_0 = attrs["multiscales"][0]["datasets"][0]
-        channel_axis = None
-        if "channel" in atypes:
-            channel_axis = atypes.index("channel")
+        scales = self.ngffMultiscales.images[0].scale
+        axes_names = self.ngffMultiscales.images[0].axes
+        rsp["scale"] = [scales[ax] for ax in axes_names if ax != "c"]
+        # We don't know "type" of axes, but can use name:
+        if "c" in axes_names:
+            channel_axis = axes_names.index("c")
             rsp["channel_axis"] = channel_axis
-        if "coordinateTransformations" in dataset_0:
-            for transf in dataset_0["coordinateTransformations"]:
-                if "scale" in transf:
-                    scale = transf["scale"]
-                    if channel_axis is not None:
-                        scale.pop(channel_axis)
-                    rsp["scale"] = tuple(scale)
-                if "translation" in transf:
-                    translate = transf["translation"]
-                    if channel_axis is not None:
-                        translate.pop(channel_axis)
-                    rsp["translate"] = tuple(translate)
+
         if "omero" in attrs:
             colormaps = []
             ch_names = []
